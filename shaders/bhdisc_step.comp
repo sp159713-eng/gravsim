@@ -1,0 +1,204 @@
+#version 450
+layout(local_size_x = 256) in;
+
+struct P { vec4 p; vec4 v; };
+layout(std430, binding = 0) buffer Parts { P parts[]; };
+layout(std430, binding = 1) buffer Grid { int cells[]; };
+layout(std430, binding = 3) buffer Stats { uint st[16]; };
+
+layout(push_constant) uniform PC {
+    vec4 com;
+    vec4 comv;
+    vec4 src;
+    vec4 srcv;
+    uint mode;
+    uint n;
+    uint chunk;
+    uint scen;
+    float dt;
+    float last;
+    float spawnP;
+    float visc;
+} pc;
+
+const float RS = 2.0;
+const float EAT_R = 2.7;
+const int GX = 128;
+const int GY = 8;
+const int GZ = 128;
+const float CELL = 2.0;
+const vec3 ORG = vec3(-128.0, -8.0, -128.0);
+
+uint pcg(uint v) {
+    uint s = v * 747796405u + 2891336453u;
+    uint w = ((s >> ((s >> 28u) + 4u)) ^ s) * 277803737u;
+    return (w >> 22u) ^ w;
+}
+
+float rnd(inout uint s) {
+    s = pcg(s);
+    return float(s) * (1.0 / 4294967296.0);
+}
+
+vec3 sphereDir(inout uint s) {
+    float z = 2.0 * rnd(s) - 1.0;
+    float a = 6.2831853 * rnd(s);
+    float q = sqrt(max(1.0 - z * z, 0.0));
+    return vec3(q * cos(a), z, q * sin(a));
+}
+
+vec3 grav(vec3 x) {
+    float r = max(length(x), 0.01);
+    float rr = max(r - RS, 0.35);
+    return -x / r / (rr * rr);
+}
+
+float tempOf(float r, float heat) {
+    float tr = 18000.0 * pow(max(r, 6.0) / 6.0, -0.75);
+    tr = max(tr, 2800.0);
+    float ts = 9000.0 * sqrt(heat);
+    return pow(pow(tr, 4.0) + pow(ts, 4.0), 0.25);
+}
+
+int cellBase(vec3 x) {
+    ivec3 c = ivec3(floor((x - ORG) / CELL));
+    if (any(lessThan(c, ivec3(0))) || c.x >= GX || c.y >= GY || c.z >= GZ) return -1;
+    return ((c.z * GY + c.y) * GX + c.x) * 5;
+}
+
+void initPart(uint i) {
+    uint s = pcg(i * 2654435761u + 12345u + pc.scen * 7919u);
+    P q;
+    q.p = vec4(0.0, 3000.0, 0.0, 0.0);
+    q.v = vec4(0.0);
+    if (pc.scen == 0u) {
+        vec3 d = sphereDir(s);
+        float r = 5.0 * pow(rnd(s), 1.0 / 3.0);
+        q.p = vec4(pc.com.xyz + d * r, 0.0);
+        q.v = vec4(pc.comv.xyz, 1.0);
+    } else if (pc.scen == 1u) {
+        vec3 d = sphereDir(s);
+        float r = 9.0 * pow(rnd(s), 0.7);
+        vec3 off = d * r;
+        off.y *= 0.55;
+        vec3 sp = 0.003 * vec3(-off.z, 0.0, off.x);
+        vec3 turb = 0.01 * (vec3(rnd(s), rnd(s), rnd(s)) - 0.5);
+        q.p = vec4(pc.com.xyz + off, 0.0);
+        q.v = vec4(pc.comv.xyz + sp + turb, 1.0);
+    }
+    parts[i] = q;
+}
+
+void scatter(uint i) {
+    P q = parts[i];
+    if (q.v.w < 0.5) return;
+    vec3 x = q.p.xyz;
+    vec3 v = q.v.xyz;
+    int b = cellBase(x);
+    if (b >= 0) {
+        atomicAdd(cells[b], 1);
+        atomicAdd(cells[b + 1], int(v.x * 1000.0));
+        atomicAdd(cells[b + 2], int(v.y * 1000.0));
+        atomicAdd(cells[b + 3], int(v.z * 1000.0));
+        atomicAdd(cells[b + 4], int(dot(v, v) * 1000.0));
+    }
+}
+
+void step(uint i) {
+    P q = parts[i];
+    uint s = pcg(i * 9781u + pc.chunk * 6271u + 17u);
+    float dt = pc.dt;
+    if (q.v.w < 0.5) {
+        if (pc.scen == 2u && rnd(s) < pc.spawnP) {
+            vec3 j = vec3(rnd(s), rnd(s), rnd(s)) - 0.5;
+            q.p = vec4(pc.src.xyz + j * vec3(3.0, 1.2, 3.0), 0.0);
+            q.v = vec4(pc.srcv.xyz + 0.012 * (vec3(rnd(s), rnd(s), rnd(s)) - 0.5), 1.0);
+        } else {
+            return;
+        }
+    }
+    if (pc.scen == 0u && pc.com.w > 0.5) {
+        uint s0 = pcg(i * 2654435761u + 12345u);
+        vec3 d0 = sphereDir(s0);
+        float r0 = 5.0 * pow(rnd(s0), 1.0 / 3.0);
+        vec3 xl = pc.com.xyz + pc.comv.xyz * dt + d0 * r0;
+        parts[i] = P(vec4(xl, 0.0), vec4(pc.comv.xyz, 1.0));
+        return;
+    }
+    vec3 x = q.p.xyz;
+    vec3 v = q.v.xyz;
+    float heat = q.p.w;
+    float r = length(x);
+    float rxz = max(length(x.xz), 0.01);
+    vec3 rh = vec3(x.x, 0.0, x.z) / rxz;
+    vec3 th = vec3(-rh.z, 0.0, rh.x);
+
+    int b = cellBase(x);
+    float cnt = 0.0;
+    if (b >= 0) {
+        cnt = float(cells[b]);
+        if (cnt >= 3.0) {
+            vec3 vm = vec3(cells[b + 1], cells[b + 2], cells[b + 3]) / (1000.0 * cnt);
+            vec3 dv = v - vm;
+            float lam = (1.0 - exp(-0.03 * dt * min(cnt / 6.0, 1.0))) * smoothstep(0.05, 0.15, length(dv));
+            float dis = 0.5 * lam * dot(dv, dv);
+            heat += dis * 40.0;
+            atomicAdd(st[3], uint(dis * 4000.0));
+            v -= dv * lam;
+        }
+    }
+
+    if (pc.visc > 0.0 && rxz < 100.0 && abs(x.y) < 8.0) {
+        float om = sqrt(1.0 / (rxz * pow(max(rxz - RS, 0.4), 2.0)));
+        float gam = 0.4 * om * pc.visc;
+        float vr = dot(v, rh);
+        v -= rh * vr * (1.0 - exp(-gam * dt));
+        v.y *= exp(-2.0 * gam * dt);
+        float eps = 0.0068 * om * pc.visc;
+        v -= th * dot(v, th) * (1.0 - exp(-eps * dt));
+    }
+
+    float om0 = sqrt(1.0 / (max(r, 2.5) * pow(max(r - RS, 0.35), 2.0)));
+    int ns = clamp(int(ceil(dt * om0 / 0.05)), 1, 24);
+    float h = dt / float(ns);
+    bool eaten = false;
+    for (int k = 0; k < ns; k++) {
+        vec3 a = grav(x);
+        v += 0.5 * h * a;
+        x += h * v;
+        a = grav(x);
+        v += 0.5 * h * a;
+        if (length(x) < EAT_R) {
+            eaten = true;
+            break;
+        }
+    }
+    r = length(x);
+    if (eaten) {
+        atomicAdd(st[0], 1u);
+        parts[i] = P(vec4(0.0, 3000.0, 0.0, 0.0), vec4(0.0));
+        return;
+    }
+    if (r > 900.0) {
+        atomicAdd(st[1], 1u);
+        parts[i] = P(vec4(0.0, 3000.0, 0.0, 0.0), vec4(0.0));
+        return;
+    }
+    heat *= exp(-dt / 45.0);
+    if (pc.last > 0.5) {
+        if (r < 110.0) atomicAdd(st[2], 1u);
+        atomicAdd(st[4], 1u);
+        float t = tempOf(r, heat);
+        float inner = 1.0 + 6.0 * (1.0 - smoothstep(3.5, 9.0, r));
+        atomicAdd(st[5], uint(pow(t / 6000.0, 2.0) * inner * 64.0));
+    }
+    parts[i] = P(vec4(x, heat), vec4(v, 1.0 + min(cnt, 1023.0) / 1024.0));
+}
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.n) return;
+    if (pc.mode == 2u) initPart(i);
+    else if (pc.mode == 0u) scatter(i);
+    else step(i);
+}
